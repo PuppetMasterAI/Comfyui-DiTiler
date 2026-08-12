@@ -25,7 +25,6 @@ tiles and denoise each one independently — every tile would "think" it's the t
 ## Contents
 
 - [Architecture](#architecture)
-- [Node: Unified DiTiler](#node-unified-ditiler)
 - [File structure](#file-structure)
 - [Installation](#installation)
 - [Example workflow](#example-workflow)
@@ -60,41 +59,6 @@ Each model has an adapter (model/krea2.py, model/flux.py, model/anima.py) that p
 
 The adapter's tiling_engine attribute determines which engine the Unified DiTiler uses.
 
-## Node: Unified DiTiler
-
-Category: DiTiler
-Outputs: MODEL, CONDITIONING, CONDITIONING, LATENT
-
-Wraps a DiT model so the KSampler runs it tile-by-tile with RoPE-aware position offsets,
-Gaussian-weighted blending, and optional cross-tile context. Model architecture is
-auto-detected.
-
-### Inputs
-
-| Input | Type | Default | Description |
-|---|---|---|---|
-| model | MODEL | — | The DiT model to patch (auto-detected). |
-| clip | CLIP | — | The model's CLIP encoder. |
-| upscaled_image | IMAGE | — | The upscaled image for visual conditioning. |
-| source_latent | LATENT | — | Clean pre-upscale latent (overview source for ids_rope). |
-| upscaled_latent | LATENT | — | The upscaled working latent (defines tile grid). |
-| prompt | STRING | — | The detail prompt. |
-| tile_size | INT | 1280 | Max tile side in pixels. |
-| tile_overlap | FLOAT | 0.1 | Fraction of tile side used as overlap. |
-| visual_conditioning | FLOAT | 0.15 | Strength of per-tile visual conditioning (Krea2 only). 0.0 = disabled. |
-| cross_tile_context | FLOAT | 0.5 | Fraction of native tokens for whole-image awareness. 0.0 = disabled. |
-| tile_batch_size | INT | 1 | Tiles per model call. |
-| debug | BOOLEAN | False | Verbose logging + RoPE self-test (matrix_rope). |
-
-### Outputs
-
-| Output | Type | Description |
-|---|---|---|
-| model | MODEL | Patched model. Wire to KSampler model. |
-| positive | CONDITIONING | Encoded positive conditioning. Wire to KSampler positive. |
-| negative | CONDITIONING | Encoded negative conditioning. Wire to KSampler negative. |
-| upscaled_latent | LATENT | Passthrough. Wire to KSampler latent_image. |
-
 ### Cross-tile context
 
 When cross_tile_context > 0, each tile receives whole-image awareness:
@@ -117,6 +81,7 @@ weaker constraint). Automatically disabled for text-only models (Flux, Anima).
 
 ## File structure
 
+```
 Comfyui-DiTiler/
 ├── __init__.py                  # Node registration
 ├── ditiler.py                   # UnifiedDiTiler node (orchestration + dispatch)
@@ -130,9 +95,11 @@ Comfyui-DiTiler/
     ├── krea2.py                 # Krea2 adapter (ids_rope, multimodal)
     ├── flux.py                  # Flux adapter (ids_rope, text-only)
     └── anima.py                 # Anima adapter (matrix_rope, text-only + LLMAdapter)
+```
 
 ## Example workflow
 
+```
 KSampler #1 (base generation, 1024×1024)
      │
      ├──────────────────────────────────────────────┐  source_latent
@@ -155,6 +122,7 @@ KSampler #1 (base generation, 1024×1024)
      │
      ▼
  VAEDecode → final detailed image
+```
 
 ## Recommended settings
 
