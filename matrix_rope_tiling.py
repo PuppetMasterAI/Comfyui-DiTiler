@@ -379,6 +379,9 @@ class MatrixRopeTilingImpl:
             full_w_tok = self.w // ps
             ctx_h_tok = max(ctx["ctx_h_tok"], 1)
             ctx_w_tok = max(ctx["ctx_w_tok"], 1)
+            # context_jitter is a fraction of the context cell spacing (distance between
+            # adjacent context tokens). 1.0 = jitter spans one full cell (±half cell),
+            # 0.2 = ±20% of that. Scales automatically with the context grid size.
             row_spacing = full_h_tok / ctx_h_tok
             col_spacing = full_w_tok / ctx_w_tok
             self._ctx_jitter_row = (torch.rand_like(ctx["row_centers"]) - 0.5) * self.context_jitter * row_spacing
