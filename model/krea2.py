@@ -111,33 +111,67 @@ class Krea2Adapter(ModelAdapterBase):
             prompt_text = str(prompt or "").strip()
             tokens = clip.tokenize(prompt_text)
             cond = clip.encode_from_tokens(tokens)
-            # Track token info
-            tensor = cond[0][0] if isinstance(cond[0][0], torch.Tensor) else None
-            total = self._get_seq_len(tensor) if tensor is not None else 0
+            formatted = self.ensure_cond_format(cond)
+            # Text-only: all tokens are text
+            total = formatted[0][0].shape[1] if formatted[0][0].dim() == 3 else formatted[0][0].shape[0]
             self.last_conditioning_info = {"text_tokens": total, "img_tokens": 0}
-            return self.ensure_cond_format(cond)
+            return formatted
 
         effective_resolution = max(256, int(image_resolution * visual_strength))
         image = prepare_image(upscaled_image, effective_resolution)
         raw = encode_visual_conditioning(clip, image, prompt, SYSTEM_PROMPT_GLOBAL)
+        formatted = self.ensure_cond_format(raw)
 
-        # Track token info: get sequence length from the correct dimension
-        tensor = raw[0][0] if isinstance(raw[0][0], torch.Tensor) else None
-        total = self._get_seq_len(tensor) if tensor is not None else 0
+        # Accurate token split: tokenize text-only (no image, cheap) to count text tokens,
+        # then subtract from total to get vision tokens. No estimation needed.
+        try:
+            prompt_text = str(prompt or "").strip()
+            full_prompt = IMAGE_PAD + prompt_text
+            llama_template = LLAMA_TEMPLATE.format(SYSTEM_PROMPT_GLOBAL)
+            text_only_tokens = clip.tokenize(full_prompt, llama_template=llama_template)
+            # Count tokens in the text-only tokenization (no images attached)
+            if isinstance(text_only_tokens, list) and len(text_only_tokens) > 0:
+                entry = text_only_tokens[0]
+                if isinstance(entry, dict) and "tokens" in entry:
+                    text_tokens = len(entry["tokens"])
+                elif isinstance(entry, (list, tuple)):
+                    text_tokens = len(entry[0]) if len(entry) > 0 else 0
+                else:
+                    text_tokens = 0
+            else:
+                text_tokens = 0
+        except Exception:
+            text_tokens = 0
 
-        # Qwen3-VL vision tokens: estimate from image resolution, but never exceed total
-        img_tokens_estimate = (effective_resolution // 28) ** 2
-        img_tokens = min(img_tokens_estimate, total)
-        text_tokens = max(0, total - img_tokens)
+        # Total from the actual conditioning tensor
+        tensor = formatted[0][0]
+        total = tensor.shape[1] if tensor.dim() == 3 else tensor.shape[0]
+
+        img_tokens = max(0, total - text_tokens)
+        text_tokens = min(text_tokens, total)
 
         self.last_conditioning_info = {"text_tokens": text_tokens, "img_tokens": img_tokens}
-        return self.ensure_cond_format(raw)
-
+        return formatted
 
     def encode_negative_conditioning(self, clip, positive_conditioning):
         """Negative conditioning is zeroed positive (Krea2 convention)."""
-        from ..visual_conditioning import zero_conditioning
+        if positive_conditioning is None:
+            # Fallback: encode an empty prompt as negative
+            tokens = clip.tokenize("")
+            cond = clip.encode_from_tokens(tokens)
+            return self.ensure_cond_format(cond)
         return self.ensure_cond_format(zero_conditioning(positive_conditioning))
+
+    def zero_conditioning(conditioning):
+        """Zero out the conditioning tensors, keep all other entry elements intact."""
+        if conditioning is None:
+            return None
+        zeroed = []
+        for entry in conditioning:
+            cond = entry[0]
+            rest = [r.copy() if isinstance(r, dict) else r for r in entry[1:]]
+            zeroed.append([torch.zeros_like(cond)] + list(rest))
+        return zeroed
 
     def encode_tile_conditioning(self, clip, prompt, prepared_image):
         """Encode per-tile conditioning using Qwen3-VL with the tile crop."""
@@ -160,10 +194,22 @@ class Krea2Adapter(ModelAdapterBase):
         return SYSTEM_PROMPT_GLOBAL
 
     @staticmethod
-    def _get_seq_len(tensor: torch.Tensor) -> int:
-        """Extract sequence length from a conditioning tensor, handling both
-        2D (seq, features) and 3D (batch, seq, features) formats."""
-        if tensor is None:
+    def _get_seq_len(cond) -> int:
+        """Extract sequence length from a conditioning output, handling both
+        raw tensors and ComfyUI's [[tensor, dict], ...] format."""
+        if cond is None:
+            return 0
+        # Handle [[tensor, dict], ...] format
+        if isinstance(cond, (list, tuple)) and len(cond) > 0:
+            entry = cond[0]
+            if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                tensor = entry[0]
+            else:
+                tensor = entry
+        else:
+            tensor = cond
+
+        if not isinstance(tensor, torch.Tensor):
             return 0
         if tensor.dim() == 3:
             return tensor.shape[1]  # (batch, seq_len, features)

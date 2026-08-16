@@ -8,7 +8,8 @@ explicit per-token position IDs.
 Tiling mechanism:
   - RoPE offset: reconstruct rotation matrices via attn1_patch hook
   - Cross-tile context: extend spatial tensor via post_input hook (L-shape)
-  - Model patches: set_model_unet_function_wrapper + set_model_attn1_patch + set_model_post_input_patch
+
+Model patches: set_model_unet_function_wrapper + set_model_attn1_patch + set_model_post_input_patch
 
 Model-agnostic: works with any model using precomputed-matrix RoPE
 (Anima/Cosmos Predict2 today, future Cosmos derivatives tomorrow).
@@ -44,8 +45,10 @@ def reconstruct_rope_from_seqs(pos_embedder, seq_t, seq_h, seq_w, device, dtype=
     h_theta = 10000.0 * pos_embedder.h_ntk_factor
     w_theta = 10000.0 * pos_embedder.w_ntk_factor
     t_theta = 10000.0 * pos_embedder.t_ntk_factor
+
     dim_spatial_range = pos_embedder.dim_spatial_range.to(device=device)
     dim_temporal_range = pos_embedder.dim_temporal_range.to(device=device)
+
     h_spatial_freqs = 1.0 / (h_theta ** dim_spatial_range)
     w_spatial_freqs = 1.0 / (w_theta ** dim_spatial_range)
     temporal_freqs = 1.0 / (t_theta ** dim_temporal_range)
@@ -93,7 +96,8 @@ class MatrixRopeTilingImpl:
                  cross_tile_context_index=0, debug=False,
                  concat_padding_mask=True, vae_scale=8,
                  thumb_weight=1.0, strip_weight=1.0,
-                 source_latent=None, context_jitter=0.0):
+                 source_latent=None, context_jitter=0.0,
+                 lllite=None, context_start_percent=0.0, context_end_percent=1.0):
         self.tile_width = tile_width
         self.tile_height = tile_height
         self.tile_overlap = tile_overlap
@@ -108,13 +112,22 @@ class MatrixRopeTilingImpl:
         self.debug = debug
         self.concat_padding_mask = concat_padding_mask
         self.vae_scale = vae_scale
-        self.thumb_weight = thumb_weight 
-        self.strip_weight = strip_weight 
-        self.source_latent = source_latent 
-        self.context_jitter = context_jitter 
-        self._ctx_jitter_row = None 
-        self._ctx_jitter_col = None  
+        self.thumb_weight = thumb_weight
+        self.strip_weight = strip_weight
+        self.source_latent = source_latent
+        self.context_jitter = context_jitter
+        self.lllite = lllite
+        self.context_start_percent = context_start_percent
+        self.context_end_percent = context_end_percent
+        self._current_sigma = None
+        self._sigma_start = None  
+        self._schedule_percent = 0.0  
+        self._logged_sigmas = []
+
+        self._ctx_jitter_row = None
+        self._ctx_jitter_col = None
         self._jitter_debug_printed_steps = set()
+        self._printed_ntk = False
 
         # Token budget: context tokens capped at 1.0x tile tokens.
         # This prevents the quadratic thumb term from overwhelming the tile's
@@ -132,10 +145,11 @@ class MatrixRopeTilingImpl:
         self._current_context_shape = None
         self._current_bbox = None
         self._current_x_in = None
+        self._current_timestep = None
 
         self._debug_state = {"verified": False, "printed_apply": False,
                              "printed_fire": False, "printed_context": False,
-                             "warned_batch": False}
+                             "printed_jitter_apply": False, "warned_batch": False}
 
     # ---------------------------------------------------------------- tiling
 
@@ -179,20 +193,13 @@ class MatrixRopeTilingImpl:
             cond_text_tokens=getattr(self, '_cond_text_tokens', None),
             cond_img_tokens=getattr(self, '_cond_img_tokens', None),
         )
-
         if len(self.bboxes) == 1:
             print("[DiTiler] [!] Only 1 tile -- tiling NOT happening.")
 
     # ------------------------------------------------ context geometry
 
     def _compute_context_geometry(self, H, W):
-        """Compute the context grid so total context tokens ≈ cross_tile_context × tile tokens.
-
-        cross_tile_context now directly controls the ratio of context tokens to the tile's
-        own token count (0.1 = context is ~10% of the tile's tokens). This replaces the old
-        'fraction of the native grid' interpretation, which produced a much higher effective
-        ratio because h_strip/v_strip scale with the tile dimensions.
-        """
+        """Compute the context grid so total context tokens ≈ cross_tile_context × tile tokens."""
         ps = self.patch_spatial
         tile_h_tok = self.bboxes[0].h // ps
         tile_w_tok = self.bboxes[0].w // ps
@@ -218,24 +225,19 @@ class MatrixRopeTilingImpl:
         ctx_w_tok = max(1, int(round(ctx_w_tok)))
         ctx_h_tok = max(1, int(round(ctx_h_tok)))
 
-        # Never exceed the native grid
         ctx_w_tok = min(ctx_w_tok, full_w_tok)
         ctx_h_tok = min(ctx_h_tok, full_h_tok)
 
         return ctx_h_tok * ps, ctx_w_tok * ps
 
     def _init_cross_tile_context_geometry(self, H, W):
-        """Store the context geometry for later use. Actual computation is
-        deferred to _compute_context_geometry which needs bboxes initialized."""
-        pass  # Geometry is computed on-demand in _compute_context_geometry
+        """Geometry is computed on-demand in _compute_context_geometry."""
+        pass
 
     # ------------------------------------------------ cross-tile context
 
     def _build_context_embeddings(self, bbox):
-        """Builds L-shape context: horizontal strip + vertical strip + 2D thumbnail.
-        The cross_tile_context fraction is applied per-axis to the native resolution,
-        then capped by the token budget to prevent attention domination."""
-
+        """Builds L-shape context: horizontal strip + vertical strip + 2D thumbnail."""
         x_in = self._current_x_in
         context_source = self.source_latent if self.source_latent is not None else x_in
         ps = self.patch_spatial
@@ -258,20 +260,18 @@ class MatrixRopeTilingImpl:
             src_w_off, src_w_span = bbox.x, bbox.w
 
         B, C, T = context_source.shape[0], context_source.shape[1], context_source.shape[2]
-
         weight_dtype = next(self.x_embedder.parameters()).dtype
         weight_device = next(self.x_embedder.parameters()).device
 
         def _embed(pooled):
             if self.concat_padding_mask:
                 mask_ch = torch.zeros(pooled.shape[0], 1, pooled.shape[2],
-                                    pooled.shape[3], pooled.shape[4],
-                                    dtype=pooled.dtype, device=pooled.device)
+                                      pooled.shape[3], pooled.shape[4],
+                                      dtype=pooled.dtype, device=pooled.device)
                 pooled = torch.cat([pooled, mask_ch], dim=1)
             return self.x_embedder(pooled.to(device=weight_device, dtype=weight_dtype))
 
-        # 1. Horizontal strip: tile's rows from source, pooled in W.
-        #    Target H = bbox.h (working latent) so it matches the tile's H tokens.
+        # 1. Horizontal strip
         row_band = context_source[:, :, :, src_h_off:src_h_off + src_h_span, :]
         band_bt = row_band.permute(0, 2, 1, 3, 4).reshape(B * T, C, src_h_span, native_W)
         h_strip_bt = torch.nn.functional.interpolate(
@@ -279,8 +279,7 @@ class MatrixRopeTilingImpl:
         h_strip = h_strip_bt.reshape(B, T, C, bbox.h, ctx_w_latent).permute(0, 2, 1, 3, 4)
         h_strip_emb = _embed(h_strip)
 
-        # 2. Vertical strip: tile's columns from source, pooled in H.
-        #    Target W = bbox.w (working latent) so it matches the tile's W tokens.
+        # 2. Vertical strip
         col_band = context_source[:, :, :, :, src_w_off:src_w_off + src_w_span]
         band_bt = col_band.permute(0, 2, 1, 3, 4).reshape(B * T, C, native_H, src_w_span)
         v_strip_bt = torch.nn.functional.interpolate(
@@ -288,7 +287,7 @@ class MatrixRopeTilingImpl:
         v_strip = v_strip_bt.reshape(B, T, C, ctx_h_latent, bbox.w).permute(0, 2, 1, 3, 4)
         v_strip_emb = _embed(v_strip)
 
-        # 3. Thumbnail: full source image pooled to context grid.
+        # 3. Thumbnail
         full_bt = context_source.permute(0, 2, 1, 3, 4).reshape(B * T, C, native_H, native_W)
         thumb_bt = torch.nn.functional.interpolate(
             full_bt, size=(ctx_h_latent, ctx_w_latent), mode='bilinear', align_corners=False)
@@ -300,7 +299,6 @@ class MatrixRopeTilingImpl:
         ctx_h_tok = v_strip_emb.shape[2]
         full_w_tok = self.w // ps
         full_h_tok = self.h // ps
-
         col_centers = (torch.arange(ctx_w_tok, dtype=torch.float, device=weight_device) + 0.5) * (full_w_tok / ctx_w_tok)
         row_centers = (torch.arange(ctx_h_tok, dtype=torch.float, device=weight_device) + 0.5) * (full_h_tok / ctx_h_tok)
 
@@ -333,12 +331,20 @@ class MatrixRopeTilingImpl:
             "ctx_h_tok": ctx_h_tok, "ctx_w_tok": ctx_w_tok,
         }
 
+    # ---------------------------------------------------------- post_input
+
     def post_input(self, io_dict):
         if not (self.use_cross_tile_context and self.cross_tile_context > 0) or self.x_embedder is None:
             return io_dict
-        # Skip entirely when both weights are zero — prevents attention dilution
+        # --- sigma gate: L-shape context only active within its window ---
         if self.thumb_weight <= 0.0 and self.strip_weight <= 0.0:
             return io_dict
+        # --- schedule gate: context only active within its percent window ---
+        if not (self.context_start_percent
+                <= self._schedule_percent
+                <= self.context_end_percent):
+            return io_dict
+            
         x = io_dict.get("img")
         if x is None or self._current_bbox is None:
             return io_dict
@@ -355,31 +361,24 @@ class MatrixRopeTilingImpl:
         if thumb.shape[0] != x.shape[0]:
             thumb = thumb.expand(x.shape[0], *thumb.shape[1:])
 
-        # --- Apply component weights ---
+        # Apply component weights
         if self.strip_weight != 1.0:
             h_strip = h_strip * self.strip_weight
             v_strip = v_strip * self.strip_weight
         if self.thumb_weight != 1.0:
             thumb = thumb * self.thumb_weight
-        # --- End weight application ---
 
         self._current_context_col_centers = ctx["col_centers"]
         self._current_context_row_centers = ctx["row_centers"]
         self._current_context_shape = (ctx["ctx_h_tok"], ctx["ctx_w_tok"])
 
-        # Per-forward jitter: randomize context RoPE positions so the grid
-        # pattern can't build up coherently across denoising steps.
-        # Generated here (once per forward pass) so every attn1_patch layer
-        # in this step sees the same jittered positions.
+        # Per-forward jitter
         if self.context_jitter > 0:
             ps = self.patch_spatial
             full_h_tok = self.h // ps
             full_w_tok = self.w // ps
             ctx_h_tok = max(ctx["ctx_h_tok"], 1)
             ctx_w_tok = max(ctx["ctx_w_tok"], 1)
-            # context_jitter is a fraction of the context cell spacing (distance between
-            # adjacent context tokens). 1.0 = jitter spans one full cell (±half cell),
-            # 0.2 = ±20% of that. Scales automatically with the context grid size.
             row_spacing = full_h_tok / ctx_h_tok
             col_spacing = full_w_tok / ctx_w_tok
             self._ctx_jitter_row = (torch.rand_like(ctx["row_centers"]) - 0.5) * self.context_jitter * row_spacing
@@ -391,11 +390,6 @@ class MatrixRopeTilingImpl:
         top = torch.cat([x, h_strip], dim=3)
         bottom = torch.cat([v_strip, thumb], dim=3)
         combined = torch.cat([top, bottom], dim=2)
-
-        self._current_context_col_centers = ctx["col_centers"]
-        self._current_context_row_centers = ctx["row_centers"]
-        self._current_context_shape = (ctx["ctx_h_tok"], ctx["ctx_w_tok"])
-
         io_dict["img"] = combined
         return io_dict
 
@@ -404,9 +398,10 @@ class MatrixRopeTilingImpl:
     def attn1_patch(self, q, k, v, pe=None, attn_mask=None, extra_options=None):
         if pe is None or self.pos_embedder is None:
             return {}
-        T, H, W = self._current_tile_shape
 
+        T, H, W = self._current_tile_shape
         t_off, h_off, w_off = self._current_offset
+
         context_active = (self._current_context_col_centers is not None
                           and self._current_context_row_centers is not None)
 
@@ -420,24 +415,21 @@ class MatrixRopeTilingImpl:
         if context_active:
             ctx_row = self._current_context_row_centers.to(q.device)
             ctx_col = self._current_context_col_centers.to(q.device)
-            if self._ctx_jitter_row is not None:
+            if self._ctx_jitter_row is not None: # jit needed to not have the same position each step and influence the same position too much (create lines)
                 ctx_row = ctx_row + self._ctx_jitter_row.to(q.device)
                 ctx_col = ctx_col + self._ctx_jitter_col.to(q.device)
-
-            # --- DEBUG: confirm jittered positions reach RoPE ---
-            if self.debug and not self._debug_state.get("printed_jitter_apply"):
-                self._debug_state["printed_jitter_apply"] = True
-                print(f"[DiTiler][JITTER-APPLY] seq_h last3 (context)={ctx_row[-3:].tolist()} "
-                      f"seq_w last3 (context)={ctx_col[-3:].tolist()} "
-                      f"jitter_active={self._ctx_jitter_row is not None}")
-            # --- END DEBUG ---
 
             seq_h = torch.cat([seq_h, ctx_row])
             seq_w = torch.cat([seq_w, ctx_col])
 
         new_pe = reconstruct_rope_from_seqs(self.pos_embedder, seq_t, seq_h, seq_w,
                                             q.device, dtype=pe.dtype)
-
+        # LLLite FiLM modulation on q/k/v (runs only when AnimaLLLitePatch has
+        # populated model_patch_data, i.e. within its sigma window).
+        if self.lllite is not None and extra_options is not None:
+            out = self.lllite.attn_patch(q, k, v, pe=new_pe,
+                                         attn_mask=attn_mask, extra_options=extra_options)
+            return out
         return {"pe": new_pe}
 
     # ---------------------------------------------------------------- call
@@ -448,11 +440,33 @@ class MatrixRopeTilingImpl:
         c_in: dict = args["c"]
 
         self._maybe_init(x_in)
+
         N = x_in.shape[0]
         x_buffer = torch.zeros_like(x_in)
-
         self._current_timestep = float(t_in.flatten()[0].item())
-
+        # Track sigma for schedule gating (matches AnimaLLLitePatch's sigmas.max())
+        _to = c_in.get("transformer_options", {})
+        _sigmas = _to.get("sigmas")
+        self._current_sigma = float(_sigmas.max().item()) if _sigmas is not None \
+            else self._current_timestep
+        # --- detail-pass-relative schedule percent ---
+        # Track starting sigma (the max sigma = beginning of this pass).
+        if self._sigma_start is None or self._current_sigma > self._sigma_start + 1e-6:
+            self._sigma_start = self._current_sigma
+        # percent: 0.0 at the start of THIS pass, 1.0 at the end
+        if self._sigma_start and self._sigma_start > 1e-8:
+            self._schedule_percent = min(1.0, max(0.0,
+                1.0 - self._current_sigma / self._sigma_start))
+        else:
+            self._schedule_percent = 0.0
+        # Gate LLLite by percent (engine drives activation via patch strength)
+        if self.lllite is not None:
+            lllite_on = (self.lllite.start_percent
+                         <= self._schedule_percent
+                         <= self.lllite.end_percent)
+            self.lllite.patch.strength = (self.lllite.base_strength
+                                          if lllite_on else 0.0)
+        
         num_batches = ceildiv(len(self.bboxes), self.tile_batch_size)
         batches = [
             self.bboxes[i * self.tile_batch_size:(i + 1) * self.tile_batch_size]
@@ -478,11 +492,39 @@ class MatrixRopeTilingImpl:
                     v = repeat_to_batch_size(v, x_tile.shape[0])
                 c_tile[k] = v
 
-            # Forward transformer_options so model-level patches
-            # (post_input for L-shape context, attn1_patch for RoPE offset) fire.
+            # Forward transformer_options so model-level patches fire.
             c_tile["transformer_options"] = dict(c_in.get("transformer_options", {}))
+            # Track sigma for L-shape gating (read from transformer_options if present)
+            sigmas = c_tile["transformer_options"].get("sigmas")
+            self._current_sigma = float(sigmas.max().item()) if sigmas is not None else float(t_in.flatten()[0].item())
+            sigma = self._current_sigma
+            last = getattr(self, "_last_status_sigma", None)
+            # ---- debug: per-step engine status ----
+            if self.debug:
+                if sigma is not None and (last is None or abs(sigma - last) > 1e-6):
+                    self._last_status_sigma = sigma
+                    pct = self._schedule_percent
+                    ctx_on = (
+                        self.use_cross_tile_context and self.cross_tile_context > 0
+                        and self.x_embedder is not None
+                        and not (self.thumb_weight <= 0.0 and self.strip_weight <= 0.0)
+                        and (self.context_start_percent <= pct <= self.context_end_percent)
+                    )
+                    lll = getattr(self, "lllite", None)
+                    lll_on = (
+                        lll is not None and lll.base_strength != 0.0
+                        and (lll.start_percent <= pct <= lll.end_percent)
+                    )
+                    tag = "" if (ctx_on or lll_on) else "  [no conditioning engine]"
+                    print(f"[DiTiler] sigma={sigma:.4f} percent={pct:.3f}  "
+                        f"context={'ON ' if ctx_on else 'off'}  "
+                        f"lllite={'ON ' if lll_on else 'off'}{tag}", flush=True)
+            # equal sigma = CFG cond/uncond duplicate for the same step -> ignore
 
             bbox = bboxes[0]
+            # Per-tile LLLite control-image crop
+            if self.lllite is not None:
+                self.lllite.set_tile_image(bbox, self.vae_scale)
             self._current_offset = (0, bbox.y // ps, bbox.x // ps)
             t_tokens = x_in.shape[-3] // pt
             self._current_tile_shape = (t_tokens, bbox.h // ps, bbox.w // ps)

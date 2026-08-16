@@ -28,19 +28,29 @@ class AnimaAdapter(ModelAdapterBase):
     tiling_engine = "matrix_rope"
 
     supports_image_conditioning = False   # Qwen3 0.6B text-only
-    use_prompt_prefix = True
+    use_prompt_prefix = False
     context_key = "context"
     context_dim = 1024
     position_dims = 3
-
     vae_compression = 8
-    packing_size = 2                      # patch_spatial
+    packing_size = 2  # patch_spatial
     cross_tile_context_index = 0
 
+    # ---- AnimaLLLite structural conditioning (internal config) ----
+    lllite_grayscale = True          # convert control image to grayscale
+    lllite_strength = 1.0            # FiLM modulation strength
+    # Sigma window where LLLite is ACTIVE. AnimaLLLitePatch self-gates on these.
+    lllite_start_percent = 0.0     # turns ON at 10% denoise if 0.1
+    lllite_end_percent = 0.3     # turns OFF at 90% denoise if 0.9
+
+    # ---- L-shape cross-tile context sigma gating (internal config) ----
+    # Active in the EARLY denoise phase (cross-tile consistency), staggered so
+    # it never overlaps LLLite (avoids the sequence-length mismatch).
+    context_start_percent = 0.4     # context ON at 10% denoise if 0.1
+    context_end_percent = 0.6      # context OFF at 85% denoise if 0.85
     # L-shape context component weights — tune here to isolate effects.
-    # 1.0 = full strength, 0.0 = silent (zeroed values).
     thumb_weight = 1.0     # 2D whole-image thumbnail <- no impact
-    strip_weight = 1.0   # horizontal strip + vertical strip
+    strip_weight = 1.0    # horizontal strip + vertical strip
     context_jitter = 1.0    # RoPE position jitter # normalized: 1.0 = one full context-cell of jitter, 0.2 = 20%
 
     def detect(self, diffusion_model) -> bool:

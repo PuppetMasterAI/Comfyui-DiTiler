@@ -60,17 +60,29 @@ class FluxAdapter(ModelAdapterBase):
         Returns the raw ComfyUI conditioning format from clip.encode_from_tokens
         WITHOUT any reshaping.
         """
-        prompt_text = str(prompt or "").strip()
-        tokens = clip.tokenize(prompt_text)
-        return self.ensure_cond_format(clip.encode_from_tokens(tokens))
+        tokens = clip.tokenize(prompt)
+        # return_dict=True gives {"cond", "pooled_output", "attention_mask", ...}
+        cond = clip.encode_from_tokens(tokens, return_dict=True)
+        # Keep ALL metadata keys (attention_mask included), not just pooled_output
+        conditioning = [[
+            cond["cond"],
+            {k: v for k, v in cond.items() if k != "cond"},
+        ]]
+        return conditioning
 
     def encode_negative_conditioning(self, clip, positive_conditioning):
         """
         Negative conditioning is an empty-prompt encode (Flux convention).
         Returns the raw ComfyUI conditioning format WITHOUT any reshaping.
         """
-        tokens = clip.tokenize("")
-        return self.ensure_cond_format(clip.encode_from_tokens(tokens))
+        # Zero the tensor but KEEP the dict (attention_mask + pooled_output),
+        # matching what ConditioningZeroOut produces.
+        zeroed = []
+        for entry in positive_conditioning:
+            cond = entry[0]
+            rest = [r.copy() if isinstance(r, dict) else r for r in entry[1:]]
+            zeroed.append([torch.zeros_like(cond)] + list(rest))
+        return zeroed
 
     def encode_tile_conditioning(self, clip, prompt, prepared_image):
         """

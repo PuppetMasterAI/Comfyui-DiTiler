@@ -16,6 +16,7 @@ from typing import List, Tuple
 
 from .tiling_core import BBox, split_bboxes, gaussian_weight, repeat_to_batch_size, ceildiv, print_run_info
 
+
 # ---------------------------------------------------------------------------
 # Position axes helper
 # ---------------------------------------------------------------------------
@@ -108,6 +109,7 @@ def make_debug_sequence_patch(state, bbox, row_off, col_off, ctx_token_count,
         total_img = img_ids.shape[1]
         tile_count = total_img - ctx_token_count
         bi = batch_item_idx
+
         tile_ids = img_ids[bi, :tile_count].detach().cpu()
         ctx_ids = img_ids[bi, tile_count:tile_count + ctx_token_count].detach().cpu()
 
@@ -131,7 +133,9 @@ def make_debug_sequence_patch(state, bbox, row_off, col_off, ctx_token_count,
 
 class IdsRopeTilingImpl:
     """Tiling engine for models with explicit position IDs (img_ids).
-    Modifies img_ids via post_input patches to give each tile its true position."""
+
+    Modifies img_ids via post_input patches to give each tile its true position.
+    """
 
     def __init__(
         self,
@@ -160,6 +164,8 @@ class IdsRopeTilingImpl:
         self.tile_batch_size = tile_batch_size
         self.patch_size = patch_size
         self.debug = debug
+
+        # Cross-tile context (whole-image overview)
         self.use_cross_tile_context = use_cross_tile_context
         self.cross_tile_context = cross_tile_context
         self.cross_tile_context_index = cross_tile_context_index
@@ -197,7 +203,6 @@ class IdsRopeTilingImpl:
     def _apply_tile_contexts(self, c_tile, bboxes, batch_idx, N, device):
         if self.tile_contexts is None:
             return
-
         if len(self.tile_contexts) != len(self.bboxes):
             if not self._warned_tile_contexts:
                 print(f"[DiTiler] tile_contexts count {len(self.tile_contexts)} "
@@ -208,7 +213,6 @@ class IdsRopeTilingImpl:
         start = batch_idx * self.tile_batch_size
         end = start + len(bboxes)
         ctxs = self.tile_contexts[start:end]
-
         if len(ctxs) != len(bboxes):
             return
 
@@ -222,7 +226,6 @@ class IdsRopeTilingImpl:
                 if isinstance(v, torch.Tensor) and v.dim() in (2, 3) and v.shape[-1] == self.context_dim:
                     context_key = k
                     break
-
         if context_key is None:
             return
 
@@ -241,12 +244,10 @@ class IdsRopeTilingImpl:
                     t = t[:1]
             else:
                 return
-
             if dtype is not None:
                 t = t.to(device=device, dtype=dtype)
             else:
                 t = t.to(device=device)
-
             if t.shape[0] != N:
                 t = repeat_to_batch_size(t, N)
             batched.append(t)
@@ -269,25 +270,19 @@ class IdsRopeTilingImpl:
         """Remove cross-tile context tokens whose scaled positions fall inside any tile."""
         if tokens is None or ids is None:
             return None, None
-
         row_positions = ids[0, :, 1].detach().float().cpu()
         col_positions = ids[0, :, 2].detach().float().cpu()
-
         keep_mask = torch.ones(row_positions.shape[0], dtype=torch.bool, device="cpu")
-
         for bbox in bboxes:
             row_off = bbox.y // p
             col_off = bbox.x // p
             tile_h_tokens = bbox.h // p
             tile_w_tokens = bbox.w // p
-
             row_in_tile = (row_positions >= row_off) & (row_positions < row_off + tile_h_tokens)
             col_in_tile = (col_positions >= col_off) & (col_positions < col_off + tile_w_tokens)
             keep_mask &= ~(row_in_tile & col_in_tile)
-
         if keep_mask.sum().item() == 0:
             return None, None
-
         return (
             tokens[:, keep_mask.to(device=tokens.device), :],
             ids[:, keep_mask.to(device=ids.device), :],
@@ -339,7 +334,8 @@ class IdsRopeTilingImpl:
             torch.arange(ctx_w, device=tokens.device, dtype=torch.float32) + 0.5
         ) * (full_w / ctx_w)
 
-        ids = torch.zeros(ctx_h, ctx_w, self.position_dims, device=tokens.device, dtype=torch.float32)
+        ids = torch.zeros(ctx_h, ctx_w, self.position_dims,
+                          device=tokens.device, dtype=torch.float32)
         ids[..., 0] = self.cross_tile_context_index
         ids[..., 1] = row_centers[:, None]
         ids[..., 2] = col_centers[None, :]
@@ -390,17 +386,14 @@ class IdsRopeTilingImpl:
         # Area-based, aspect-ratio-preserving context grid calculation
         max_tokens = full_h * full_w
         target_tokens = self.cross_tile_context * max_tokens
-
-        aspect = full_h / full_w
+        aspect = full_h / max(full_w, 1)
         ctx_w = max(2, round(math.sqrt(target_tokens / aspect)))
         ctx_h = max(2, round(ctx_w * aspect))
-
         ctx_h = min(ctx_h, full_h)
         ctx_w = min(ctx_w, full_w)
 
         source_desc = "working latent (noised)"
         capped = False
-
         if self.source_latent is not None:
             ref_H, ref_W = self.source_latent.shape[-2], self.source_latent.shape[-1]
             ref_full_h = max(1, ref_H // p)
@@ -422,7 +415,7 @@ class IdsRopeTilingImpl:
                 ctx_h = max(1, min(ctx_h, ref_full_h))
                 ctx_w = max(1, min(ctx_w, ref_full_w))
 
-        self._cross_tile_ctx_h, self._cross_tile_ctx_w = ctx_h, ctx_w   
+        self._cross_tile_ctx_h, self._cross_tile_ctx_w = ctx_h, ctx_w
 
     # ------------------------------------------------------------------
     # Main wrapper entry point
@@ -434,10 +427,10 @@ class IdsRopeTilingImpl:
         c_in: dict = args["c"]
 
         self._maybe_init(x_in)
-
         N = x_in.shape[0]
         x_buffer = torch.zeros_like(x_in)
 
+        # Build cross-tile context tokens (once, shared across all tiles)
         context_tokens = context_ids = None
         if self.use_cross_tile_context:
             context_tokens, context_ids = self._build_cross_tile_context_tokens(x_in)
@@ -477,14 +470,15 @@ class IdsRopeTilingImpl:
             patches = dict(transformer_options.get("patches", {}))
             post_input = list(patches.get("post_input", []))
 
+            # 1. Tile offset patch
             offsets_per_batch_item = []
             for bbox in bboxes:
                 row_off = bbox.y // p
                 col_off = bbox.x // p
                 offsets_per_batch_item.extend([(row_off, col_off)] * N)
-
             post_input.append(make_tile_offset_patch(offsets_per_batch_item))
 
+            # 2. Cross-tile context tokens
             ctx_count = 0
             if context_tokens is not None:
                 ctx_t, ctx_ids_stripped = self._strip_overlapping_context_tokens(
@@ -497,7 +491,7 @@ class IdsRopeTilingImpl:
                     post_input.append(make_extra_tokens_patch(ctx_t, ctx_ids_stripped))
                     ctx_count = ctx_t.shape[1]
 
-            # Sequence debug: register LAST so it sees the fully assembled sequence.
+            # 3. Sequence debug: register LAST so it sees the fully assembled sequence.
             if (
                 self.debug
                 and not self._debug_seq_state["printed"]

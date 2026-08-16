@@ -120,6 +120,10 @@ class UnifiedDiTiler:
                 }),
             },
             "optional": {
+                "model_patch": ("MODEL_PATCH", {
+                    "tooltip": "Anima LLLite model patch from ModelPatchLoader. "
+                            "Enables per-tile structural conditioning (Anima only).",
+                }),
                 "tile_batch_size": ("INT", {
                     "default": 1,
                     "min": 1,
@@ -157,6 +161,7 @@ class UnifiedDiTiler:
         tile_overlap,
         visual_conditioning,
         cross_tile_context,
+        model_patch=None,
         tile_batch_size=1,
         debug=False,
     ):
@@ -228,27 +233,10 @@ class UnifiedDiTiler:
         )
         negative = adapter.encode_negative_conditioning(clip, positive)
 
-        # Extract conditioning token info for the debug print
-        cond_text_tokens = None
-        cond_img_tokens = None
-        for entry in positive:
-            if isinstance(entry, (list, tuple)) and len(entry) > 0:
-                tensor = entry[0]
-                if isinstance(tensor, torch.Tensor):
-                    total = tensor.shape[0] if tensor.dim() == 2 else tensor.shape[1]
-                    if adapter.supports_image_conditioning and visual_conditioning > 0.0:
-                        # Multimodal: estimate image tokens from adapter's last encode info
-                        info = getattr(adapter, 'last_conditioning_info', None)
-                        if info:
-                            cond_text_tokens = info.get("text_tokens", total)
-                            cond_img_tokens = info.get("img_tokens", 0)
-                        else:
-                            cond_text_tokens = total
-                            cond_img_tokens = 0
-                    else:
-                        cond_text_tokens = total
-                        cond_img_tokens = 0
-                    break
+        # Read token info from the adapter for the debug print
+        cond_info = getattr(adapter, 'last_conditioning_info', None)
+        cond_text_tokens = cond_info.get("text_tokens") if cond_info else None
+        cond_img_tokens = cond_info.get("img_tokens") if cond_info else None
         
         # ------------------------------------------------------------------
         # 4. Encode per-tile visual conditioning (multimodal models only).
@@ -352,42 +340,52 @@ class UnifiedDiTiler:
             x_embedder = adapter.get_embedding_layer(diffusion_model)
             concat_padding_mask = adapter.get_concat_padding_mask(diffusion_model)
             patch_temporal = adapter.get_patch_temporal(diffusion_model)
-
             use_ctx = use_cross_tile_context
             if use_ctx and x_embedder is None:
-                print(
-                    f"[DiTiler] cross_tile_context requested but x_embedder "
-                    f"not found -- disabling."
-                )
+                print(f"[DiTiler] cross_tile_context requested but x_embedder not found -- disabling.")
                 use_ctx = False
             if use_ctx and adapter.has_extra_pos_embedder(diffusion_model):
-                print(
-                    f"[DiTiler] checkpoint has extra_pos_embedder -- "
-                    f"disabling cross_tile_context to avoid shape mismatch."
-                )
+                print(f"[DiTiler] checkpoint has extra_pos_embedder -- disabling cross_tile_context.")
                 use_ctx = False
 
+            # model_sampling needed for percent->sigma conversion (LLLite + context)
+            model_sampling = model.get_model_object("model_sampling")
+
+            context_start_percent = getattr(adapter, "context_start_percent", 0.0)
+            context_end_percent = getattr(adapter, "context_end_percent", 1.0)
+
+            lllite_handler = None
+            if model_patch is not None:
+                from .model.anima_lllite import AnimaLLLiteTiling
+                lllite_handler = AnimaLLLiteTiling(
+                    model_patch, upscaled_image, adapter,
+                    strength=getattr(adapter, "lllite_strength", 1.0),
+                    start_percent=getattr(adapter, "lllite_start_percent", 0.0),
+                    end_percent=getattr(adapter, "lllite_end_percent", 1.0),
+                )
+                model.set_model_post_input_patch(lllite_handler.patch)
+                model.set_model_attn2_patch(lllite_handler.attn2_patch)
+                model.set_model_patch(lllite_handler.mlp_patch, "mlp_patch")
+
             impl = MatrixRopeTilingImpl(
-                tile_width=tile_w,
-                tile_height=tile_h,
+                tile_width=tile_w, tile_height=tile_h,
                 tile_overlap=min(overlap_x, overlap_y),
                 tile_batch_size=tile_batch_size,
-                patch_spatial=patch_size,
-                patch_temporal=patch_temporal,
-                pos_embedder=pos_embedder,
-                x_embedder=x_embedder,
+                patch_spatial=patch_size, patch_temporal=patch_temporal,
+                pos_embedder=pos_embedder, x_embedder=x_embedder,
                 use_cross_tile_context=use_ctx,
                 cross_tile_context=cross_tile_context,
                 cross_tile_context_index=adapter.cross_tile_context_index,
-                debug=debug,
-                concat_padding_mask=concat_padding_mask,
+                debug=debug, concat_padding_mask=concat_padding_mask,
                 vae_scale=compression,
-                thumb_weight=getattr(adapter, 'thumb_weight', 1.0),  
-                strip_weight=getattr(adapter, 'strip_weight', 1.0), 
+                thumb_weight=getattr(adapter, 'thumb_weight', 1.0),
+                strip_weight=getattr(adapter, 'strip_weight', 1.0),
                 source_latent=source_tensor,
                 context_jitter=getattr(adapter, 'context_jitter', 0.0),
+                context_start_percent=context_start_percent,
+                context_end_percent=context_end_percent,
+                lllite=lllite_handler,
             )
-
             impl._cond_text_tokens = cond_text_tokens
             impl._cond_img_tokens = cond_img_tokens
             model.set_model_unet_function_wrapper(impl)
